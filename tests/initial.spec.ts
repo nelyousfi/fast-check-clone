@@ -1,32 +1,48 @@
-const sum = (a: number, b: number): number => {
-    if (a > 0 && b > 0) {
-        return a + b
-    }
-    return -1
+const arePositive = (a: number, b: number): boolean => {
+    return a > 0 && b > 0
 }
 
-const assert = <T>(property: T, predicate: (args: T) => boolean) => {
-    const run1 = predicate(property)
-    const out = {
-        failed: !run1,
-    }
+const assert = <T>(out: { failed: boolean }) => {
     if (out.failed) {
         throw new Error('Failed!')
     }
 }
 
+const property = <T>(
+    arbitrary: T,
+    predicate: (arbitraryValue: T) => boolean
+) => {
+    return {
+        failed: !predicate(arbitrary),
+    }
+}
+
 describe('initial', () => {
-    it('should sum two numbers', () => {
+    it('should returns true', () => {
         assert(
-            {
-                a: 1,
-                b: 2,
-            },
-            ({ a, b }) => {
-                const received = sum(a, b)
-                const expected = a + b
-                return received === expected
-            }
+            property(
+                {
+                    a: 1,
+                    b: 2,
+                },
+                ({ a, b }) => {
+                    return arePositive(a, b)
+                }
+            )
+        )
+    })
+
+    it('should returns false', () => {
+        assert(
+            property(
+                {
+                    a: 1,
+                    b: -2,
+                },
+                ({ a, b }) => {
+                    return !arePositive(a, b)
+                }
+            )
         )
     })
 })
