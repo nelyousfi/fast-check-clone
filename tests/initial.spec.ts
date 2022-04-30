@@ -1,3 +1,9 @@
+import {
+    RandomGenerator,
+    unsafeUniformIntDistribution,
+    xorshift128plus,
+} from 'pure-rand'
+
 export const decompPrime = (n: number): number[] => {
     // Quick implementation: the maximal number supported is 2**31-1
     let done = false
@@ -17,67 +23,202 @@ export const decompPrime = (n: number): number[] => {
     return [...factors, n]
 }
 
-abstract class Arbitrary<T> {
-    abstract generate(): T
+class Random {
+    private readonly internalRandomGenerator: RandomGenerator
+
+    constructor(randomGenerator: RandomGenerator) {
+        this.internalRandomGenerator = randomGenerator
+    }
+
+    nextInt(min: number, max: number): number {
+        return unsafeUniformIntDistribution(
+            min,
+            max,
+            this.internalRandomGenerator
+        )
+    }
 }
 
-class ArbitraryNumber extends Arbitrary<number> {
-    constructor(readonly max: number) {
+class NextValue<T> {
+    readonly value: T
+
+    constructor(value: T) {
+        this.value = value
+    }
+}
+
+abstract class NextArbitrary<T> {
+    abstract generate(random: Random): NextValue<T>
+}
+
+class IntegerArbitrary extends NextArbitrary<number> {
+    constructor(private readonly min: number, private readonly max: number) {
         super()
     }
 
-    generate(): number {
-        return Math.floor(Math.random() * this.max)
+    generate(random: Random): NextValue<number> {
+        return new NextValue(random.nextInt(this.min, this.max))
     }
 }
 
-class Property<T> {
+function nat(arg: number) {
+    return new IntegerArbitrary(0, arg)
+}
+
+interface INextProperty<T> {
+    generate(random: Random): NextValue<T>
+
+    run(v: T): Error | string | null
+}
+
+class Property<T> implements INextProperty<T> {
     constructor(
-        readonly arbitrary: Arbitrary<T>,
-        readonly predicate: (arbitraryValue: T) => boolean | void
+        readonly arbitrary: NextArbitrary<T>,
+        readonly predicate: (v: T) => void | boolean
     ) {}
 
-    run(maxRuns: number): RunDetails {
-        for (let i = 0; i < maxRuns; ++i) {
-            const arbitraryValue = this.arbitrary.generate()
-            const result = this.predicate(arbitraryValue)
-            if (result === false) {
-                return { failed: true }
-            }
-        }
-        return { failed: false }
+    generate(random: Random): NextValue<T> {
+        return this.arbitrary.generate(random)
+    }
+
+    run(v: T): string | null {
+        const out = this.predicate(v)
+        // TODO: add PreconditionFailure
+        return out == null || out ? null : 'Property failed by returning false'
     }
 }
 
-const property = <T>(
-    arbitrary: Arbitrary<T>,
-    predicate: (arbitraryValue: T) => boolean | void
-) => {
-    return new Property(arbitrary, predicate)
-}
-
-type RunDetails = { failed: boolean }
-
-const check = <T>(
-    property: Property<T>,
-    { maxRuns }: Parameters
-): RunDetails => {
-    return property.run(maxRuns)
+function property<T>(
+    arbitrary: NextArbitrary<T>,
+    predicate: (x: T) => void | boolean
+) {
+    return new Property(arbitrary, (t) => predicate(t))
 }
 
 interface Parameters {
-    readonly maxRuns: number
+    maxRuns?: number
 }
 
-const assert = <T>(property: Property<T>, params: Parameters) => {
-    const out = check(property, params)
-    if (out.failed) {
-        throw new Error('Failed!')
+interface RunDetails {
+    failed: boolean
+}
+
+function reportRunDetails(out: RunDetails) {
+    if (!out.failed) return
+    throw new Error('Property failed')
+}
+
+function* toss<T>(
+    property: INextProperty<T>,
+    seed: number,
+    random: (seed: number) => RandomGenerator
+) {
+    const randomGenerator = random(seed)
+    while (true) {
+        yield () => property.generate(new Random(randomGenerator))
     }
 }
 
-function nat(max: number): Arbitrary<number> {
-    return new ArbitraryNumber(max)
+class Stream<T> {
+    constructor(private readonly g: IterableIterator<T>) {}
+
+    [Symbol.iterator](): IterableIterator<T> {
+        return this.g
+    }
+
+    next(): IteratorResult<T> {
+        return this.g.next()
+    }
+}
+
+function stream<T>(g: IterableIterator<T>) {
+    return new Stream(g)
+}
+
+function buildInitialValues<T>(
+    valueProducers: IterableIterator<() => NextValue<T>>
+) {
+    return stream(valueProducers)
+}
+
+class SourceValuesIterator<T> implements IterableIterator<T> {
+    constructor(readonly initialValues: IterableIterator<() => T>) {}
+
+    [Symbol.iterator](): IterableIterator<T> {
+        return this
+    }
+
+    next(): IteratorResult<T> {
+        const n = this.initialValues.next()
+        return n.done
+            ? { done: true, value: undefined }
+            : { done: false, value: n.value() }
+    }
+}
+
+class RunExecution<T> {
+    private failed: boolean = false
+
+    fail() {
+        this.failed = true
+    }
+
+    toRunDetails(): RunDetails {
+        return { failed: this.failed }
+    }
+}
+
+class RunnerIterator<T> implements IterableIterator<T> {
+    runExecution: RunExecution<T>
+
+    constructor(readonly sourceValues: SourceValuesIterator<T>) {
+        this.runExecution = new RunExecution()
+    }
+
+    [Symbol.iterator](): IterableIterator<T> {
+        return this
+    }
+
+    next(): IteratorResult<T> {
+        const nextValue = this.sourceValues.next()
+        return nextValue.done
+            ? { done: true, value: undefined }
+            : { done: false, value: nextValue.value }
+    }
+
+    handleResult(result: string | null) {
+        if (result != null) {
+            this.runExecution.fail()
+        }
+    }
+}
+
+function runIt<T>(
+    property: INextProperty<T>,
+    sourceValues: SourceValuesIterator<NextValue<T>>
+) {
+    const runner = new RunnerIterator(sourceValues)
+    for (const v of runner) {
+        const out = property.run(v)
+        runner.handleResult(out)
+    }
+    return runner.runExecution
+}
+
+function check<T>(property: INextProperty<T>, params: Parameters) {
+    const generator = toss(
+        property,
+        Date.now() ^ (Math.random() * 0x100000000),
+        xorshift128plus
+    )
+    const initialValues = buildInitialValues(generator)
+    const sourceValues = new SourceValuesIterator(initialValues)
+    return runIt(property, sourceValues).toRunDetails()
+}
+
+function assert<T>(property: INextProperty<T>, params: Parameters) {
+    const out = check(property, params)
+    reportRunDetails(out)
 }
 
 describe('decampPrime', () => {
