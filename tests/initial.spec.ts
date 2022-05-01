@@ -23,6 +23,8 @@ export const decompPrime = (n: number): number[] => {
     return [...factors, n]
 }
 
+const MAX_INPUT = 65536
+
 class Random {
     private readonly internalRandomGenerator: RandomGenerator
 
@@ -61,8 +63,28 @@ class IntegerArbitrary extends NextArbitrary<number> {
     }
 }
 
-function nat(arg: number) {
-    return new IntegerArbitrary(0, arg)
+type ArbsArray<T extends unknown[]> = { [K in keyof T]: NextArbitrary<T[K]> }
+
+class TupleArbitrary<T extends unknown[]> extends NextArbitrary<T> {
+    constructor(readonly arbs: ArbsArray<T>) {
+        super()
+    }
+
+    generate(random: Random): NextValue<T> {
+        const vs = [] as unknown as T & unknown[]
+        for (const arb of this.arbs) {
+            vs.push(arb.generate(random).value)
+        }
+        return new NextValue(vs)
+    }
+}
+
+function nat(max: number) {
+    return new IntegerArbitrary(0, max)
+}
+
+function integer(min: number, max: number) {
+    return new IntegerArbitrary(min, max)
 }
 
 interface INextProperty<T> {
@@ -84,19 +106,14 @@ class Property<T> implements INextProperty<T> {
     run(v: T): string | null {
         const out = this.predicate(v)
         // TODO: add PreconditionFailure
-        return out == null || out ? null : 'Property failed by returning false'
+        return out == null || out === true
+            ? null
+            : 'Property failed by returning false'
     }
 }
 
-function property<T>(
-    arbitrary: NextArbitrary<T>,
-    predicate: (x: T) => void | boolean
-) {
-    return new Property(arbitrary, (t) => predicate(t))
-}
-
 interface Parameters {
-    maxRuns?: number
+    numRuns?: number
 }
 
 interface RunDetails {
@@ -142,17 +159,23 @@ function buildInitialValues<T>(
 }
 
 class SourceValuesIterator<T> implements IterableIterator<T> {
-    constructor(readonly initialValues: IterableIterator<() => T>) {}
+    constructor(
+        readonly initialValues: IterableIterator<() => T>,
+        private maxInitialIterations: number
+    ) {}
 
     [Symbol.iterator](): IterableIterator<T> {
         return this
     }
 
     next(): IteratorResult<T> {
-        const n = this.initialValues.next()
-        return n.done
-            ? { done: true, value: undefined }
-            : { done: false, value: n.value() }
+        if (--this.maxInitialIterations !== -1) {
+            const n = this.initialValues.next()
+            if (!n.done) {
+                return { done: false, value: n.value() }
+            }
+        }
+        return { done: true, value: undefined }
     }
 }
 
@@ -171,7 +194,7 @@ class RunExecution<T> {
 class RunnerIterator<T> implements IterableIterator<T> {
     runExecution: RunExecution<T>
 
-    constructor(readonly sourceValues: SourceValuesIterator<T>) {
+    constructor(readonly sourceValues: SourceValuesIterator<NextValue<T>>) {
         this.runExecution = new RunExecution()
     }
 
@@ -181,9 +204,11 @@ class RunnerIterator<T> implements IterableIterator<T> {
 
     next(): IteratorResult<T> {
         const nextValue = this.sourceValues.next()
-        return nextValue.done
-            ? { done: true, value: undefined }
-            : { done: false, value: nextValue.value }
+        const something = nextValue.value
+        if (nextValue.done) {
+            return { done: true, value: undefined }
+        }
+        return { done: false, value: nextValue.value.value }
     }
 
     handleResult(result: string | null) {
@@ -197,23 +222,49 @@ function runIt<T>(
     property: INextProperty<T>,
     sourceValues: SourceValuesIterator<NextValue<T>>
 ) {
+    // RunnerIterator will just generate the next value from the SourceValuesIterator
     const runner = new RunnerIterator(sourceValues)
     for (const v of runner) {
-        const out = property.run(v)
+        const out = property.run(v) as string | null
         runner.handleResult(out)
     }
     return runner.runExecution
 }
 
 function check<T>(property: INextProperty<T>, params: Parameters) {
+    // calls `generate` on the property by passing the random generator.
+    // this `generate` property will also call generate on the arbitrary by passing the same random generator.
+    // this will return a generated NextValue depending on the type of the arbitrary
     const generator = toss(
         property,
         Date.now() ^ (Math.random() * 0x100000000),
         xorshift128plus
     )
     const initialValues = buildInitialValues(generator)
-    const sourceValues = new SourceValuesIterator(initialValues)
+    // this SourceValuesIterator is controlling when to stop the generation of values
+    const sourceValues = new SourceValuesIterator(
+        initialValues,
+        params.numRuns || 100
+    )
     return runIt(property, sourceValues).toRunDetails()
+}
+
+function property<T0>(
+    arb0: NextArbitrary<T0>,
+    predicate: (t0: T0) => void | boolean
+): INextProperty<[T0]>
+
+function property<T0, T1>(
+    arb0: NextArbitrary<T0>,
+    arb1: NextArbitrary<T1>,
+    predicate: (t0: T0, t1: T1) => void | boolean
+): INextProperty<[T0, T1]>
+
+function property<T>(...args: any): any {
+    const arbs = args.slice(0, args.length - 1)
+    const p = args[args.length - 1]
+    const tuple = new TupleArbitrary(arbs)
+    return new Property(tuple, (t) => p(...t))
 }
 
 function assert<T>(property: INextProperty<T>, params: Parameters) {
@@ -231,45 +282,22 @@ describe('decampPrime', () => {
                 return productOfFactors === n
             }),
             {
-                maxRuns: 10,
+                numRuns: 10,
             }
         )
     })
 
-    // it('should be able to decompose a product of two numbers', () => {
-    //     assert(
-    //         property(
-    //             {
-    //                 a: 4,
-    //                 b: 5,
-    //             },
-    //             ({ a, b }) => {
-    //                 const n = a * b
-    //                 const factors = decompPrime(n)
-    //                 return factors.length >= 2
-    //             }
-    //         )
-    //     )
-    // })
-    //
-    // it('should compute the same factors as to the concatenation of the one of a and b for a times b', () => {
-    //     assert(
-    //         property(
-    //             {
-    //                 a: 4,
-    //                 b: 5,
-    //             },
-    //             ({ a, b }) => {
-    //                 const factorsA = decompPrime(a)
-    //                 const factorsB = decompPrime(b)
-    //                 const factorsAB = decompPrime(a * b)
-    //                 const reorder = (arr: number[]) =>
-    //                     [...arr].sort((a, b) => a - b)
-    //                 expect(reorder(factorsAB)).toEqual(
-    //                     reorder([...factorsA, ...factorsB])
-    //                 )
-    //             }
-    //         )
-    //     )
-    // })
+    it('should be able to decompose a product of two numbers', () => {
+        assert(
+            property(integer(2, MAX_INPUT), integer(2, MAX_INPUT), (a, b) => {
+                console.log({ a, b })
+                const n = a * b
+                const factors = decompPrime(n)
+                return factors.length >= 2
+            }),
+            {
+                numRuns: 4,
+            }
+        )
+    })
 })
