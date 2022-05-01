@@ -51,6 +51,26 @@ class NextValue<T> {
 
 abstract class NextArbitrary<T> {
     abstract generate(random: Random): NextValue<T>
+
+    map<U>(mapper: (t: T) => U): NextArbitrary<U> {
+        return new MapArbitrary(this, mapper)
+    }
+}
+
+class MapArbitrary<T, U> extends NextArbitrary<U> {
+    constructor(readonly arb: NextArbitrary<T>, readonly mapper: (t: T) => U) {
+        super()
+    }
+
+    generate(random: Random): NextValue<U> {
+        const g = this.arb.generate(random)
+        return this.valueMapper(g)
+    }
+
+    private valueMapper(v: NextValue<T>): NextValue<U> {
+        const value = this.mapper(v.value)
+        return new NextValue(value)
+    }
 }
 
 class IntegerArbitrary extends NextArbitrary<number> {
@@ -85,6 +105,10 @@ function nat(max: number) {
 
 function integer(min: number, max: number) {
     return new IntegerArbitrary(min, max)
+}
+
+function char() {
+    return new IntegerArbitrary(0x20, 0x7e).map((n) => String.fromCharCode(n))
 }
 
 interface INextProperty<T> {
@@ -294,6 +318,18 @@ describe('decampPrime', () => {
                 const n = a * b
                 const factors = decompPrime(n)
                 return factors.length >= 2
+            }),
+            {
+                numRuns: 4,
+            }
+        )
+    })
+
+    it('should return one single char', () => {
+        assert(
+            property(char(), (s) => {
+                console.log(s)
+                return typeof s === 'string'
             }),
             {
                 numRuns: 4,
